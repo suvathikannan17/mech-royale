@@ -100,6 +100,7 @@ class ArenaMap:
             self.nx = int((self.maxx - self.minx) / self.CELL) + 1
             self.ny = int((self.maxy - self.miny) / self.CELL) + 1
             self.blocked = bytearray(self.nx * self.ny)
+            self.building_pts = []  # centroids of ground-blocking prisms
             terr = w["terrain"]
             self.tx0, self.ty0 = terr["minX"], terr["minY"]
             self.tnx, self.tny = terr["nx"], terr["ny"]
@@ -164,6 +165,7 @@ class ArenaMap:
             cym = sum(ys) / len(ys)
             if p.get("base", 0) > self.ground_z(cxm, cym) + 1.5:
                 continue
+            self.building_pts.append((cxm, cym))
             x0, x1 = min(xs), max(xs)
             y0, y1 = min(ys), max(ys)
             c0x, c0y = self._cell(x0, y0)
@@ -210,6 +212,33 @@ class ArenaMap:
                 if not self.is_blocked(px, py):
                     return (px, py)
         return (x, y)
+
+    def has_cover_near(self, x, y, r):
+        """Is there a building within r metres of (x, y)?"""
+        for (bx, by) in self.building_pts:
+            if (bx - x) * (bx - x) + (by - y) * (by - y) < r * r:
+                return True
+        return False
+
+    def cover_point(self, fx, fy, tx, ty, max_dist=90.0):
+        """A point to run to that puts a building between us (fx, fy) and
+        the threat (tx, ty): the nearest building roughly in the away
+        direction, and a point just past it. None when there is none."""
+        ax, ay = unit(tx, ty, fx, fy)
+        best, best_d = None, 1e18
+        for (bx, by) in self.building_pts:
+            vx, vy = bx - fx, by - fy
+            d = math.hypot(vx, vy)
+            if d < 10.0 or d > max_dist:
+                continue
+            if (vx * ax + vy * ay) / (d + 1e-9) < 0.3:
+                continue  # not in the away half-plane
+            px, py = bx + ax * 12.0, by + ay * 12.0
+            if self.is_blocked(px, py):
+                continue
+            if d < best_d:
+                best_d, best = d, (px, py)
+        return best
 
     def line_clear(self, x0, y0, x1, y1):
         d = dist2(x0, y0, x1, y1)
@@ -322,9 +351,11 @@ UPGRADE_PRIORITY = [
     "lightning_range", "lightning_chain", "lightning_efficiency",
 ]
 
-# Loot priority: laser (315 dmg hitscan at 280 m) > mortar (indirect fire
-# over cover) > lightning (close-range panic weapon).
-LOOT_PRIORITY = {"laser": 0, "mortar": 1, "lightning": 2}
+# Loot priority: mortar first — it fights from behind cover without
+# exposing us (lob at last-known positions), then laser (315 dmg hitscan,
+# but it telegraphs and halves our speed while charging), then lightning
+# (close-range panic weapon).
+LOOT_PRIORITY = {"mortar": 0, "laser": 1, "lightning": 2}
 
 WEAPON_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning",
                  "explosion", "npc_gun"}
@@ -370,6 +401,8 @@ class Bot:
         self.patrol_goal = None
         self.patrol_until = 0.0
         self.laser_charging_since = None
+        self.flee_cover = None   # cached cover point while fleeing
+        self.flee_cover_t = -1e9
         self.failed_take = {}    # pickup id -> t (don't retry at once)
         self.mode = "patrol"
         self.t = 0.0
@@ -413,8 +446,11 @@ class Bot:
                 self.last_heard_bearing = (s.get("bearing"), s.get("dist"), now)
         for ev in obs.get("events", []):
             if ev.get("type") == "damaged":
-                self.last_damage_t = now
-                self.last_damage_bearing = ev.get("bearing")
+                # Only damage from an attacker counts for fleeing. Zone
+                # damage has by=None and must not trigger a flee.
+                if ev.get("by") is not None:
+                    self.last_damage_t = now
+                    self.last_damage_bearing = ev.get("bearing")
             elif ev.get("type") == "take_failed":
                 self.failed_take[ev.get("id")] = now
 
@@ -431,11 +467,15 @@ class Bot:
         return best, bestd
 
     def is_safe(self, me):
-        """No enemy seen recently and no weapon sounds recently."""
+        """No enemy near and nothing loud very recently. v1 blocked all
+        looting/farming on any weapon sound within 12 s, so the bot never
+        got cubes while the house bots farmed and grew stronger — and stayed
+        the weakest target they hunt first. Sounds now block for 5 s only,
+        and only enemies within 150 m matter."""
         _, d = self.threat_near(me, 200.0)
-        if d < 200.0:
+        if d < 150.0:
             return False
-        if self.t - self.last_heard_weapon < 12.0:
+        if self.t - self.last_heard_weapon < 5.0:
             return False
         if self.t - self.last_damage_t < 10.0:
             return False
@@ -612,10 +652,17 @@ class Bot:
                     dx, dy = unit(ix, iy, mx, my)
                     return [dx, dy]
             return None
-        # Strafe perpendicular to the bullet's horizontal path.
+        # Strafe perpendicular to the bullet's horizontal path, on the side
+        # that takes us away from the nearest threat (v1 picked a fixed
+        # side and could dodge straight into the shooter).
         vx, vy = best
         d = math.hypot(vx, vy) or 1.0
         px, py = -vy / d, vx / d
+        threat, _ = self.threat_near(me, 300.0)
+        if threat is not None:
+            ax, ay = unit(threat["pos"][0], threat["pos"][1], mx, my)
+            if px * ax + py * ay < 0:
+                px, py = -px, -py
         return [px, py]
 
 
@@ -671,7 +718,10 @@ class Bot:
                 "weapons": list(vis_best.get("weapons") or []),
                 "charging": bool(vis_best.get("charging")), "t": t,
             }, vis_d
-        recently_hurt = (t - self.last_damage_t) < 1.5
+        # Hurt by an attacker within the last 5 s: we are being engaged.
+        # v1 only remembered 1.5 s, so it stopped fleeing and went back to
+        # duelling while the enemy was still shooting at it.
+        recently_hurt = (t - self.last_damage_t) < 5.0
         # A charging laser aimed at us is a telegraphed shot: dodge it.
         laser_aimed_at_us = False
         for m in visible_mechs:
@@ -681,13 +731,17 @@ class Bot:
                     laser_aimed_at_us = True
 
         # --- mode selection ---
+        # Never stand and duel the squad: flee when outnumbered, when being
+        # shot at, or when an enemy is close. We only shoot when nobody is
+        # shooting back at us (an ambush) or at a weak, isolated target.
         mode = "patrol"
         goal = None
         target = None       # combat/farm target dict with pos/vel/cubes
         speed = 1.0
         boost = False
         jump = False
-        if threat is not None and (threat_d < 55.0 or recently_hurt):
+        outnumbered = len(visible_mechs) >= 2
+        if threat is not None and (threat_d < 55.0 or recently_hurt or outnumbered):
             mode = "flee"
         elif recently_hurt and self.last_damage_bearing is not None:
             mode = "flee"  # hurt by someone unseen: run from the bearing
@@ -707,35 +761,41 @@ class Bot:
         loot_z = None
         drop_goal = None
         farm_target = None
-        if mode == "opportunity" and self.is_safe(me):
-            # Weapon loot (best kind we do not already hold, nearest first).
-            # Skip pickups far above us: a quarter of floor loot is on roofs
-            # and this bot stays on the ground.
-            slot1_kind = weapons[1]["kind"] if len(weapons) > 1 and weapons[1] else None
-            best_pick = None
-            for p in obs.get("pickups", []):
-                k = p.get("kind")
-                if k in held or k == "gun":
-                    continue
-                if k not in LOOT_PRIORITY:
-                    continue
-                if slot1_kind and LOOT_PRIORITY[k] >= LOOT_PRIORITY.get(slot1_kind, 99):
-                    continue  # already holding something at least as good
-                if p["pos"][2] > mz + 6.0:
-                    continue  # rooftop pickup, out of reach on foot
-                d = dist2(mx, my, p["pos"][0], p["pos"][1])
-                if d > 150.0:
-                    continue
-                rank = (LOOT_PRIORITY[k], d)
-                if best_pick is None or rank < best_pick[0]:
-                    best_pick = (rank, p)
-            if best_pick is not None:
-                loot_goal = (best_pick[1]["pos"][0], best_pick[1]["pos"][1])
-                loot_id = best_pick[1]["id"]
-                loot_kind = best_pick[1]["kind"]
-                loot_z = best_pick[1]["pos"][2]
+        if mode == "opportunity":
+            _, near_d = self.threat_near(me)
+            # Looting is quick: only a nearby enemy stops it. Farming and
+            # drops take time and make noise, so they need it truly quiet.
+            can_loot = near_d > 120.0
+            safe = self.is_safe(me)
+            if can_loot:
+                # Weapon loot (best kind we do not already hold, nearest first).
+                # Skip pickups far above us: a quarter of floor loot is on roofs
+                # and this bot stays on the ground.
+                slot1_kind = weapons[1]["kind"] if len(weapons) > 1 and weapons[1] else None
+                best_pick = None
+                for p in obs.get("pickups", []):
+                    k = p.get("kind")
+                    if k in held or k == "gun":
+                        continue
+                    if k not in LOOT_PRIORITY:
+                        continue
+                    if slot1_kind and LOOT_PRIORITY[k] >= LOOT_PRIORITY.get(slot1_kind, 99):
+                        continue  # already holding something at least as good
+                    if p["pos"][2] > mz + 6.0:
+                        continue  # rooftop pickup, out of reach on foot
+                    d = dist2(mx, my, p["pos"][0], p["pos"][1])
+                    if d > 150.0:
+                        continue
+                    rank = (LOOT_PRIORITY[k], d)
+                    if best_pick is None or rank < best_pick[0]:
+                        best_pick = (rank, p)
+                if best_pick is not None:
+                    loot_goal = (best_pick[1]["pos"][0], best_pick[1]["pos"][1])
+                    loot_id = best_pick[1]["id"]
+                    loot_kind = best_pick[1]["kind"]
+                    loot_z = best_pick[1]["pos"][2]
             # Supply drop on the ground: 3 cubes + full HP, if nobody is near.
-            if loot_goal is None:
+            if loot_goal is None and safe:
                 for d in obs.get("drops", []):
                     if d.get("lands_in", 99) > 0:
                         continue
@@ -744,7 +804,7 @@ class Bot:
                         drop_goal = (d["pos"][0], d["pos"][1])
                         break
             # Farm: nearest crate or NPC drone in gun range.
-            if loot_goal is None and drop_goal is None:
+            if loot_goal is None and drop_goal is None and safe:
                 best_farm, best_fd = None, 1e18
                 for c in obs.get("crates", []):
                     d = dist2(mx, my, c["pos"][0], c["pos"][1])
@@ -762,7 +822,7 @@ class Bot:
                 if best_farm is not None and best_fd < 130.0:
                     farm_target = best_farm
             # Loose cubes on the ground.
-            if loot_goal is None and drop_goal is None and farm_target is None:
+            if loot_goal is None and drop_goal is None and farm_target is None and safe:
                 best_cube, best_cd = None, 1e18
                 for c in obs.get("cubes", []):
                     d = dist2(mx, my, c["pos"][0], c["pos"][1])
@@ -785,11 +845,22 @@ class Bot:
                 ax, ay = -math.cos(b), -math.sin(b)
             else:
                 ax, ay = unit(mx, my, ncx, ncy)
-            gx, gy = mx + ax * 120.0, my + ay * 120.0
-            if need_next:
-                bx, by = unit(mx, my, ncx, ncy)
-                gx, gy = mx + (ax * 1.2 + bx * 0.8) * 100.0, my + (ay * 1.2 + by * 0.8) * 100.0
-            goal = (gx, gy)
+            # Run to cover, not just away: a building between us and the
+            # threat breaks their line of sight, and they lose track of us
+            # after 5 s without seeing us. Recomputed at most once a second.
+            goal = None
+            if threat is not None and self.arena.ok and \
+                    self.t - self.flee_cover_t > 1.0:
+                self.flee_cover = self.arena.cover_point(mx, my, tx, ty)
+                self.flee_cover_t = self.t
+            if self.flee_cover is not None and threat is not None:
+                goal = self.flee_cover
+            if goal is None:
+                gx, gy = mx + ax * 120.0, my + ay * 120.0
+                if need_next:
+                    bx, by = unit(mx, my, ncx, ncy)
+                    gx, gy = mx + (ax * 1.2 + bx * 0.8) * 100.0, my + (ay * 1.2 + by * 0.8) * 100.0
+                goal = (gx, gy)
             speed = 1.0
             if me["energy"] > 30.0:
                 boost = True
@@ -844,8 +915,24 @@ class Bot:
             # then scan (rotate the torso) to spot threats and loot early.
             if self.patrol_goal is None or t > self.patrol_until or \
                     dist2(mx, my, self.patrol_goal[0], self.patrol_goal[1]) < 5.0:
-                px = clamp(ncx + self.rng.uniform(-40, 40), ncx - max(0.0, nr - 10), ncx + max(0.0, nr - 10))
-                py = clamp(ncy + self.rng.uniform(-40, 40), ncy - max(0.0, nr - 10), ncy + max(0.0, nr - 10))
+                if nr < 30.0:
+                    # Endgame: never sit on the exact centre, where everyone
+                    # converges. Hold 12-18 m off-centre, preferring a spot
+                    # with a building nearby to break line of sight.
+                    best_pt, best_cover = None, False
+                    for _ in range(8):
+                        a = self.rng.uniform(0, 2 * math.pi)
+                        r = self.rng.uniform(12.0, 18.0)
+                        cx2, cy2 = ncx + math.cos(a) * r, ncy + math.sin(a) * r
+                        cover = self.arena.ok and self.arena.has_cover_near(cx2, cy2, 12.0)
+                        if cover and not best_cover:
+                            best_pt, best_cover = (cx2, cy2), True
+                        elif best_pt is None:
+                            best_pt = (cx2, cy2)
+                    px, py = best_pt
+                else:
+                    px = clamp(ncx + self.rng.uniform(-40, 40), ncx - max(0.0, nr - 10), ncx + max(0.0, nr - 10))
+                    py = clamp(ncy + self.rng.uniform(-40, 40), ncy - max(0.0, nr - 10), ncy + max(0.0, nr - 10))
                 self.patrol_goal = (px, py)
                 self.patrol_until = t + 12.0
             goal = self.patrol_goal
@@ -855,9 +942,11 @@ class Bot:
             speed = 1.0 if dist2(mx, my, goal[0], goal[1]) > 60.0 else 0.45
             self.scan_yaw = ang_norm(self.scan_yaw + 0.05)
 
-        # --- dodging overrides movement (but not a zone emergency) ---
+        # --- dodging overrides movement (but not a zone emergency or a
+        # flee to cover: running behind a building matters more than
+        # sidestepping one bullet) ---
         dodge = self.dodge_move(obs, me)
-        if dodge is not None and mode != "zone":
+        if dodge is not None and mode not in ("zone", "flee"):
             move = dodge
             if laser_aimed_at_us:
                 boost = me["energy"] > 25.0
@@ -911,7 +1000,14 @@ class Bot:
                     fire[light_i] = True
             # Laser: charge in combat at range, release on a full charge when
             # the aim is on. While charging, the torso tracks the laser.
-            if laser_i is not None and is_mech and 60.0 <= td <= 200.0 and mode == "combat":
+            # Restricted: charging telegraphs the shot and halves our speed,
+            # so a strafing target just dodges it and we stand exposed. Only
+            # charge at a slow or weak target (a hit is likely), at long range.
+            tgt_speed = math.hypot(target["vel"][0], target["vel"][1])
+            tgt_hp = target.get("hp") or 9999
+            laser_worth_it = tgt_speed < 6.0 or tgt_hp < 500
+            if laser_i is not None and is_mech and 120.0 <= td <= 200.0 \
+                    and mode == "combat" and laser_worth_it:
                 lw = weapons[laser_i]
                 charge = lw.get("charge") or 0.0
                 laim, _ = self.laser_aim(me, target)
@@ -945,6 +1041,11 @@ class Bot:
                         if dyaw < 0.05 and dpit < 0.05:
                             fire[mortar_i] = True
             # Gun: fire when the (slewed) torso is actually on target.
+            # Only at a target we can see right now: v1 shot at remembered
+            # positions up to 12 s old, wasting ammo and making 320 m of
+            # gun noise that told the whole squad exactly where we were.
+            # (Farm targets are visible by definition, so they are exempt.)
+            gun_visible = (vis_best is not None) if is_mech else True
             if gun_i is not None:
                 gw = weapons[gun_i]
                 gaim, _ = self.gun_aim(me, target)
@@ -955,7 +1056,7 @@ class Bot:
                 reloading = (gw.get("reload") or 0.0) > 0.0
                 if ammo == 0 and not reloading:
                     act["reload"] = True
-                elif td <= 200.0 and (gw.get("cooldown") or 0.0) <= 0.02 \
+                elif td <= 200.0 and gun_visible and (gw.get("cooldown") or 0.0) <= 0.02 \
                         and not reloading and (ammo or 0) > 0 \
                         and dyaw < 0.035 and dpit < 0.035:
                     fire[gun_i] = True
